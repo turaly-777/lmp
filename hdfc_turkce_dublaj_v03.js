@@ -1,583 +1,564 @@
 
 /*
- * HD Film Cehennemi - Lampa Turkish Dub (MVP 0.3.0)
- * Context-menu integration + cautious film matching + direct media discovery.
- * The site's HTML/search URL and embedded player are NOT verified end-to-end.
- * Does not solve third-party iframe providers, CORS/403 or DRM.
+ * HDFC Turkish Dub for Lampa
+ * Version: 0.4.0
+ *
+ * Film card -> Turkish Dub button -> Search -> Stream
+ *
+ * Important:
+ * Site search markup and video hosts are not yet verified.
+ * No CORS bypass or iframe resolver is included.
  */
+
 (function () {
   'use strict';
-  var NS = 'hdfc_dub_v03';
-  if (window[NS]) return;
-  window[NS] = true;
+
+  var KEY = '__hdfc_turkish_dub_v04';
+  if (window[KEY]) return;
+  window[KEY] = true;
 
   var BASE = 'https://www.hdfilmcehennemi.nl';
-  var MAX_RESULTS = 12;
-  var CURRENT = 0;
-  var activeNetwork = null;
-  var DEBUG = !!window.hdfc_dub_debug;
+  var DEBUG = true;
+  var LIMIT = 10;
+  var network = null;
+  var generation = 0;
+  var registered = false;
 
   function log() {
-    if (DEBUG && window.console && console.log)
-      console.log.apply(console, ['[HDFC Dub]'].concat([].slice.call(arguments)));
+    if (!DEBUG || !window.console) return;
+    var args = ['[HDFC v0.4]'].concat(
+      Array.prototype.slice.call(arguments)
+    );
+    console.log.apply(console, args);
   }
 
-  function notify(message) {
-    if (window.Lampa && Lampa.Noty && Lampa.Noty.show)
-      Lampa.Noty.show('HDFC: ' + message);
-    else log(message);
+  function message(text) {
+    log(text);
+    if (window.Lampa && Lampa.Noty) {
+      Lampa.Noty.show('HDFC: ' + text);
+    }
   }
 
-  function cleanSpace(s) {
-    return String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  function str(value) {
+    return String(value == null ? '' : value)
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
-  function cleanTitle(s) {
-    return cleanSpace(s)
-      .replace(/\((?:19|20)\d{2}\)/g, ' ')
-      .replace(/\b(?:19|20)\d{2}\b/g, ' ')
-      .replace(/\b(?:türkçe|turkce)\s*(?:dublaj|altyazılı|altyazili)\b/gi, ' ')
-      .replace(/\bdublaj\s*(?:&|ve|\+)\s*altyaz[ıi]l[ıi]\b/gi, ' ')
-      .replace(/\b(?:filmini izle|film izle|hd izle|1080p|720p|4k)\b/gi, ' ')
-      .replace(/\s+(?:izle|filmi)\s*$/i, ' ')
-      .replace(/\s+/g, ' ').trim();
-  }
-
-  function norm(s) {
-    var result = cleanTitle(s).toLocaleLowerCase
-      ? cleanTitle(s).toLocaleLowerCase('tr')
-      : cleanTitle(s).toLowerCase();
-
-    result = result.replace(/ı/g, 'i')
-      .replace(/ş/g, 's')
+  function normalize(value) {
+    var s = str(value)
+      .toLowerCase()
+      .replace(/ı/g, 'i')
       .replace(/ğ/g, 'g')
-      .replace(/ç/g, 'c')
+      .replace(/ü/g, 'u')
+      .replace(/ş/g, 's')
       .replace(/ö/g, 'o')
-      .replace(/ü/g, 'u');
+      .replace(/ç/g, 'c');
 
-    if (result.normalize)
-      result = result.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    if (s.normalize) {
+      s = s.normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '');
+    }
 
-    return cleanSpace(result.replace(/[^a-z0-9]+/g, ' '))
-      .replace(/^(the|a|an)\s+/, '');
+    return s
+      .replace(/\b(19|20)\d{2}\b/g, ' ')
+      .replace(/\b(turkce|dublaj|altyazili|izle|hd|film)\b/g, ' ')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
-  function hasDub(s) {
-    return /(?:t[uü]rk[cç]e?\s*dublaj|tr\s*dublaj|t[uü]rk[cç]e?\s*seslendirme|dublaj\s*(?:&|ve|\+)\s*altyaz[ıi]l[ıi]|\bdu[bp]laj\b)/i.test(String(s || ''));
+  function yearOf(value) {
+    var match = str(value).match(/\b(?:19|20)\d{2}\b/);
+    return match ? Number(match[0]) : 0;
   }
 
-  function hasSub(s) {
-    return /(?:altyaz[ıi]l[ıi]|alt\s*yaz[ıi]|\bsubbed\b|\bsubtitles?\b)/i.test(String(s || ''));
+  function movieYear(movie) {
+    return yearOf(
+      movie.release_date ||
+      movie.first_air_date ||
+      movie.year ||
+      ''
+    );
   }
 
-  function sourceLanguage(label) {
-    var s = cleanSpace(label);
-    if (!s) return 'unknown';
+  function isSeries(movie) {
+    return movie.media_type === 'tv' ||
+      !!movie.first_air_date ||
+      !!movie.number_of_seasons;
+  }
 
-    if (/\b(?:tur|tr)\b/i.test(s) && !hasSub(s))
-      return 'dub';
+  function namesOf(movie) {
+    var items = [
+      movie.original_title,
+      movie.title,
+      movie.original_name,
+      movie.name
+    ];
 
-    if (hasDub(s) && !hasSub(s))
-      return 'dub';
+    var alternative = movie.alternative_titles || {};
+    var extra = alternative.titles || alternative.results || [];
 
-    if (hasSub(s) && !hasDub(s))
-      return 'sub';
+    if (Array.isArray(extra)) {
+      extra.forEach(function (item) {
+        if (item && item.title) {
+          items.push(item.title);
+        }
+      });
+    }
 
-    if (hasSub(s) && hasDub(s))
-      return 'ambiguous';
+    var seen = {};
+    return items.filter(function (item) {
+      var n = normalize(item);
+      if (n.length < 3 || seen[n]) return false;
+      seen[n] = true;
+      return true;
+    }).slice(0, 8);
+  }
+
+  function isDub(text) {
+    var s = str(text).toLowerCase();
+
+    return /t[uü]rk[cç]e\s*dublaj|t[uü]rk[cç]e\s*seslendirme|\btr\s*dublaj\b|\bdublaj\b|\bdubbed\b/.test(s);
+  }
+
+  function isSubtitle(text) {
+    return /altyaz[ıi]|alt\s*yaz[ıi]|\bsubbed\b|\bsubtitle\b/i
+      .test(str(text));
+  }
+
+  function dubStatus(text) {
+    var dub = isDub(text);
+    var sub = isSubtitle(text);
+
+    if (dub && sub) return 'mixed';
+    if (dub) return 'dub';
+    if (sub) return 'sub';
 
     return 'unknown';
   }
 
-  function filmYear(movie) {
-    var x = movie && (
-      movie.release_date ||
-      movie.first_air_date ||
-      movie.year ||
-      movie.start_date ||
-      ''
-    );
+  function safeUrl(value, base) {
+    try {
+      var url = new URL(value, base);
 
-    var match = String(x).match(/\b(?:19|20)\d{2}\b/);
-    return match ? Number(match[0]) : 0;
+      if (url.protocol !== 'http:' &&
+          url.protocol !== 'https:') {
+        return '';
+      }
+
+      return url.href;
+    } catch (error) {
+      return '';
+    }
   }
 
-  function aliases(movie) {
-    var list = [
-      movie.original_title,
-      movie.title,
-      movie.original_name,
-      movie.name,
-      movie.international_title
-    ];
+  function sameSite(url) {
+    try {
+      var host = new URL(url).hostname.toLowerCase();
 
-    var seen = {};
-
-    return list.map(cleanTitle).filter(function (s) {
-      var n = norm(s);
-      if (n.length < 3 || seen[n]) return false;
-      seen[n] = true;
-      return true;
-    });
+      return host === 'hdfilmcehennemi.nl' ||
+        host === 'www.hdfilmcehennemi.nl';
+    } catch (error) {
+      return false;
+    }
   }
 
-  function splitNames(s) {
-    var cleaned = cleanTitle(s);
+  function isFilmPage(url) {
+    if (!sameSite(url)) return false;
 
-    return [cleaned]
-      .concat(cleaned.split(/\s+[-–—]\s+|\s+[\/]\s+/))
-      .filter(Boolean);
+    var u = new URL(url);
+
+    if (u.pathname === '/') return false;
+    if (u.searchParams.has('s')) return false;
+
+    return !/^\/(category|tag|page|author|search|tur|yil|dil)\//i
+      .test(u.pathname);
   }
 
-  function titleScore(candidate, variants, targetYear, foundYear) {
-    if (targetYear && foundYear && targetYear !== foundYear)
+  function parseDocument(html) {
+    if (typeof html !== 'string') {
+      throw new Error('HTML cavabi metn deyil');
+    }
+
+    if (!/<(?:html|body|div|article|a)\b/i.test(html)) {
+      throw new Error('HTML formati taninmadi');
+    }
+
+    return new DOMParser()
+      .parseFromString(html, 'text/html');
+  }
+
+  function pickText(element, selector) {
+    var selected = element.querySelector(selector);
+    return selected ? str(selected.textContent) : '';
+  }
+
+  function scoreTitle(candidate, names, targetYear, actualYear) {
+    if (targetYear && actualYear &&
+        targetYear !== actualYear) {
       return -1;
+    }
+
+    var actual = normalize(candidate);
+    if (!actual) return 0;
 
     var best = 0;
 
-    splitNames(candidate).forEach(function (part) {
-      var a = norm(part);
-      if (!a) return;
+    names.forEach(function (name) {
+      var expected = normalize(name);
+      if (!expected) return;
 
-      variants.forEach(function (name) {
-        var b = norm(name);
-        if (!b) return;
+      if (actual === expected) {
+        best = Math.max(best, 100);
+      } else if (
+        expected.length >= 8 &&
+        actual.length >= 8 &&
+        (actual.indexOf(expected) !== -1 ||
+         expected.indexOf(actual) !== -1)
+      ) {
+        var ratio = Math.min(
+          actual.length,
+          expected.length
+        ) / Math.max(actual.length, expected.length);
 
-        if (a === b) {
-          best = Math.max(best, 100);
-          return;
+        if (ratio >= 0.85) {
+          best = Math.max(best, 85);
         }
-
-        if (
-          a.length >= 9 &&
-          b.length >= 9 &&
-          (a.indexOf(b) !== -1 || b.indexOf(a) !== -1)
-        ) {
-          var ratio = Math.min(a.length, b.length) /
-            Math.max(a.length, b.length);
-
-          if (ratio >= 0.86)
-            best = Math.max(best, 88);
-        }
-      });
+      }
     });
 
     return best;
   }
 
-  function urlFrom(raw, origin) {
-    if (!raw || /^\s*(?:javascript:|data:|blob:)/i.test(raw))
-      return '';
-
-    try {
-      var u = new URL(raw, origin);
-      return (u.protocol === 'http:' || u.protocol === 'https:')
-        ? u.href
-        : '';
-    } catch (e) {
-      return '';
-    }
-  }
-
-  function isSiteLink(link) {
-    try {
-      var u = new URL(link);
-
-      return (
-        u.hostname === 'hdfilmcehennemi.nl' ||
-        u.hostname === 'www.hdfilmcehennemi.nl'
-      ) &&
-        !/(?:\/category\/|\/dil\/|\/tur\/|\/yil\/|\/page\/|\/tag\/|\/author\/|\/search\/)/i.test(u.pathname) &&
-        u.pathname !== '/' &&
-        !u.searchParams.has('s');
-    } catch (e) {
-      return false;
-    }
-  }
-
-  function mediaUrl(u) {
-    return /\.(?:m3u8|mp4|mpd)(?:[?#]|$)/i.test(u || '');
-  }
-
-  function parseHTML(text) {
-    if (typeof text !== 'string')
-      throw new Error('Response is not HTML text');
-
-    if (!/<(?:html|body|article|div|video|source|a)\b/i.test(text))
-      throw new Error('Unexpected page response');
-
-    return new DOMParser().parseFromString(text, 'text/html');
-  }
-
-  function attr(node, name) {
-    return node && node.getAttribute
-      ? (node.getAttribute(name) || '')
-      : '';
-  }
-
-  function findOne(node, selectors) {
-    return node && node.querySelector
-      ? node.querySelector(selectors)
-      : null;
-  }
-
-  function findAll(node, selectors) {
-    return node && node.querySelectorAll
-      ? [].slice.call(node.querySelectorAll(selectors))
-      : [];
-  }
-
-  function extractLabel(card) {
-    var titleNode = findOne(
-      card,
-      '.movie-title, .film-title, .title, h2, h3, h4, a[title], img[alt]'
+  function searchResults(html, url, names, year) {
+    var documentNode = parseDocument(html);
+    var cards = documentNode.querySelectorAll(
+      'article, .movie-item, .film-item, ' +
+      '.filmbox, .post, .movie, .film'
     );
 
-    var title = titleNode
-      ? (
-        attr(titleNode, 'title') ||
-        attr(titleNode, 'alt') ||
-        titleNode.textContent
-      )
-      : '';
-
-    if (!title)
-      title = attr(card, 'title');
-
-    if (!title) {
-      var a = findOne(card, 'a[href]');
-      title = a && (
-        attr(a, 'title') ||
-        (a.textContent || '')
-      );
-    }
-
-    return cleanSpace(title);
-  }
-
-  function yearInCard(card, rawTitle) {
-    var y = findOne(
-      card,
-      '[data-year], .year, .yil, time[datetime], .date'
-    );
-
-    var text = (
-      y && (
-        attr(y, 'data-year') ||
-        attr(y, 'datetime') ||
-        y.textContent
-      )
-    ) || String(rawTitle || '');
-
-    var match = String(text).match(/\b(?:19|20)\d{2}\b/);
-    return match ? Number(match[0]) : 0;
-  }
-
-  function parseSearchResults(html, pageUrl, names, year) {
-    var doc = parseHTML(html);
     var output = [];
     var seen = {};
 
-    var cards = findAll(
-      doc,
-      'article, .movie-item, .film-item, .filmbox, .post, .film, .movie, .item'
-    );
-
-    cards.forEach(function (card) {
-      var link = findOne(
-        card,
-        'h2 a[href], h3 a[href], h4 a[href], .title a[href], a[href]'
+    Array.prototype.forEach.call(cards, function (card) {
+      var anchor = card.querySelector(
+        'h2 a[href], h3 a[href], ' +
+        '.title a[href], a[href]'
       );
 
-      if (!link) return;
+      if (!anchor) return;
 
-      var url = urlFrom(attr(link, 'href'), pageUrl);
+      var link = safeUrl(
+        anchor.getAttribute('href'),
+        url
+      );
 
-      if (!url || !isSiteLink(url) || seen[url])
+      if (!link || !isFilmPage(link) || seen[link]) {
         return;
+      }
 
-      var title =
-        extractLabel(card) ||
-        attr(link, 'title') ||
-        cleanSpace(link.textContent);
+      var title = pickText(
+        card,
+        'h2, h3, .movie-title, .film-title, .title'
+      );
 
-      var y = yearInCard(card, title);
-      var score = titleScore(title, names, year, y);
+      if (!title) {
+        title = str(
+          anchor.getAttribute('title') ||
+          anchor.textContent
+        );
+      }
 
-      if (score < 88 || !hasDub(card.textContent || ''))
-        return;
+      var yearNode = card.querySelector(
+        '[data-year], .year, .yil, time[datetime]'
+      );
 
-      seen[url] = true;
+      var actualYear = yearNode
+        ? yearOf(
+            yearNode.getAttribute('data-year') ||
+            yearNode.getAttribute('datetime') ||
+            yearNode.textContent
+          )
+        : yearOf(title);
+
+      var score = scoreTitle(
+        title,
+        names,
+        year,
+        actualYear
+      );
+
+      if (score < 85) return;
+
+      // This is a candidate, not yet a playable film.
+      // Final dubbing confirmation happens on film page.
+      var status = dubStatus(card.textContent);
+
+      if (status === 'sub') return;
+
+      seen[link] = true;
 
       output.push({
         title: title,
-        year: y,
-        url: url,
+        url: link,
+        year: actualYear,
         score: score,
-        dubbed: true
+        dubStatus: status
       });
     });
 
-    return output
-      .sort(function (a, b) {
-        return b.score - a.score;
-      })
-      .slice(0, MAX_RESULTS);
+    return output.sort(function (a, b) {
+      return b.score - a.score;
+    }).slice(0, LIMIT);
   }
 
-  function playerSourceLabel(el) {
-    var text = [
-      attr(el, 'label'),
-      attr(el, 'title'),
-      attr(el, 'data-audio'),
-      attr(el, 'data-language'),
-      attr(el, 'lang')
+  function mediaUrl(url) {
+    return /\.(mp4|m3u8|mpd)(?:$|[?#])/i.test(url);
+  }
+
+  function streamLanguage(element) {
+    var texts = [
+      element.getAttribute('data-audio'),
+      element.getAttribute('data-language'),
+      element.getAttribute('data-lang'),
+      element.getAttribute('lang'),
+      element.getAttribute('label'),
+      element.getAttribute('title')
     ];
 
-    if (
-      el.tagName &&
-      el.tagName.toLowerCase() === 'a'
-    ) {
-      text.push(el.textContent || '');
-    }
-
-    var scope = el.closest && el.closest(
-      '[data-audio], [data-language], [data-lang], .tab-pane, .source-item, .video-source'
+    var parent = element.closest(
+      '[data-audio], [data-language], ' +
+      '[data-lang], .video-source, .source-item'
     );
 
-    if (scope) {
-      text.push(
-        attr(scope, 'data-audio'),
-        attr(scope, 'data-language'),
-        attr(scope, 'data-lang'),
-        attr(scope, 'title')
+    if (parent) {
+      texts.push(
+        parent.getAttribute('data-audio'),
+        parent.getAttribute('data-language'),
+        parent.getAttribute('data-lang'),
+        parent.getAttribute('title')
       );
     }
 
-    return cleanSpace(text.join(' '));
+    if (element.tagName.toLowerCase() === 'a') {
+      texts.push(element.textContent);
+    }
+
+    var explicitLang = str(texts.join(' '));
+
+    return dubStatus(explicitLang);
   }
 
-  function parseDirectStreams(html, url, cardDubbed) {
-    var doc = parseHTML(html);
+  function streamsFromFilm(html, pageUrl, candidate) {
+    var doc = parseDocument(html);
+
     var out = [];
     var seen = {};
 
-    var pageText = doc.body
-      ? cleanSpace(doc.body.textContent)
-      : '';
-
-    var pageDubbed = hasDub(pageText);
-    var pageHasSub = hasSub(pageText);
-
-    var pageIsDubOnly =
-      (pageDubbed || cardDubbed) && !pageHasSub;
-
-    var pageExplicitSubOnly =
-      pageHasSub && !pageDubbed;
-
-    var iframeCount = findAll(
-      doc,
+    var iframeCount = doc.querySelectorAll(
       'iframe[src], iframe[data-src]'
     ).length;
 
-    if (pageExplicitSubOnly) {
-      return {
-        streams: [],
-        iframeCount: iframeCount,
-        reason: 'sub_only'
-      };
+    // Metadata may contain both dubbing and subtitles.
+    // That alone cannot identify an individual audio track.
+    var metadata = doc.querySelector(
+      '.film-info, .movie-info, .post-info, ' +
+      '.entry-meta, .film-detail, .language'
+    );
+
+    var metadataStatus = dubStatus(
+      metadata ? metadata.textContent : ''
+    );
+
+    if (metadataStatus === 'unknown') {
+      metadataStatus = candidate.dubStatus;
     }
 
-    findAll(
-      doc,
+    var elements = doc.querySelectorAll(
       'video[src], video source[src], source[src], a[href]'
-    ).forEach(function (el) {
-      var path = attr(el, 'src') || attr(el, 'href');
-      var direct = urlFrom(path, url);
+    );
 
-      if (
-        !direct ||
-        !mediaUrl(direct) ||
-        seen[direct]
-      ) return;
+    Array.prototype.forEach.call(elements, function (el) {
+      var raw = el.getAttribute('src') ||
+        el.getAttribute('href');
 
-      var language = sourceLanguage(
-        playerSourceLabel(el)
-      );
+      var url = safeUrl(raw, pageUrl);
 
-      if (
-        language === 'sub' ||
-        language === 'ambiguous'
-      ) return;
+      if (!url || !mediaUrl(url) || seen[url]) {
+        return;
+      }
 
-      if (
-        language === 'unknown' &&
-        !pageIsDubOnly
-      ) return;
+      var audio = streamLanguage(el);
 
-      seen[direct] = true;
+      // Only a positively identified dubbing source.
+      // When the whole film has a dub-only label,
+      // an unlabelled single direct stream may be used.
+      var allowed = audio === 'dub' ||
+        (
+          audio === 'unknown' &&
+          metadataStatus === 'dub'
+        );
 
+      if (!allowed) return;
+
+      seen[url] = true;
       out.push({
-        url: direct,
-        title: cleanSpace(
-          attr(el, 'label') ||
-          attr(el, 'title')
-        ) || 'Türkçe Dublaj',
-        language: 'tr'
+        url: url,
+        title: 'Türkçe Dublaj',
+        quality: 'auto'
       });
     });
 
     return {
       streams: out,
       iframeCount: iframeCount,
-      reason: out.length
-        ? ''
-        : (iframeCount ? 'iframe' : 'no_direct_stream')
+      metadataStatus: metadataStatus
     };
   }
 
-  function stopPrevious() {
-    CURRENT++;
+  function abortRequests() {
+    generation++;
 
-    if (
-      activeNetwork &&
-      activeNetwork.clear
-    ) {
+    if (network) {
       try {
-        activeNetwork.clear();
-      } catch (e) {
-        log(e);
+        network.clear();
+      } catch (error) {
+        log('clear error', error);
       }
     }
 
-    activeNetwork = null;
-    return CURRENT;
+    network = null;
+    return generation;
   }
 
-  function requestHTML(url, token, done) {
-    if (token !== CURRENT) return;
+  function request(url, token, callback) {
+    if (token !== generation) return;
 
-    if (!activeNetwork)
-      activeNetwork = new Lampa.Reguest();
+    var instance = new Lampa.Reguest();
+    network = instance;
+
+    log('GET', url);
 
     try {
-      activeNetwork.native(
+      instance.silent(
         url,
-        function (result) {
-          if (token === CURRENT)
-            done(null, result);
+        function (response) {
+          if (token !== generation) return;
+          callback(null, response);
         },
-        function (xhr, error) {
-          if (token === CURRENT) {
-            done(
-              new Error(
-                'HTTP/CORS error: ' +
-                ((xhr && xhr.status) || '') +
-                ' ' +
-                (error || '')
-              )
-            );
-          }
+        function (error) {
+          if (token !== generation) return;
+          callback(
+            new Error('Request failed: ' + str(error))
+          );
         },
-        null,
+        false,
         {
           dataType: 'text',
           timeout: 15000
         }
       );
-    } catch (e) {
-      if (token === CURRENT)
-        done(e);
+    } catch (error) {
+      if (token === generation) {
+        callback(error);
+      }
     }
   }
 
-  function selectList(items, title, choose) {
-    if (!items.length) {
-      notify('Uyğun nəticə tapılmadı');
+  function showItems(title, list, onSelect) {
+    if (!list.length) {
+      message('Uyğun nəticə tapılmadı');
       return;
     }
 
     Lampa.Select.show({
       title: title,
-      items: items.map(function (x) {
+      items: list.map(function (item) {
         return {
-          title: cleanSpace(x.title),
+          title: item.title,
           subtitle: (
-            x.year ? x.year + ' · ' : ''
-          ) + 'Türkçe Dublaj',
-          payload: x
+            item.year ? item.year + ' · ' : ''
+          ) + (
+            item.dubStatus === 'dub'
+              ? 'Türkçe Dublaj'
+              : 'Dublaj yoxlanılacaq'
+          ),
+          data: item
         };
       }),
-      onSelect: function (item) {
-        choose(item.payload);
+      onSelect: function (selected) {
+        if (selected && selected.data) {
+          onSelect(selected.data);
+        }
       },
       onBack: function () {
-        if (
-          Lampa.Controller &&
-          Lampa.Controller.toggle
-        ) {
-          Lampa.Controller.toggle('content');
-        }
+        Lampa.Controller.toggle('content');
       }
     });
   }
 
-  function openFilm(movie, item, token) {
-    notify('Video mənbəyi yoxlanılır');
+  function playStream(movie, stream) {
+    log('Playing', stream.url);
 
-    requestHTML(item.url, token, function (error, html) {
+    Lampa.Player.play({
+      url: stream.url,
+      title: movie.title || movie.original_title,
+      movie: movie,
+      isonline: true,
+      quality: stream.quality || 'auto'
+    });
+  }
+
+  function openCandidate(movie, candidate, token) {
+    message('Film səhifəsi yoxlanılır');
+
+    request(candidate.url, token, function (error, html) {
       if (error) {
         log(error);
-        notify('Film səhifəsi açıla bilmədi (403/CORS və ya şəbəkə)');
+        message('Film səhifəsi açılmadı: HTTP/CORS xətası');
         return;
       }
 
-      var found;
+      var result;
 
       try {
-        found = parseDirectStreams(
+        result = streamsFromFilm(
           html,
-          item.url,
-          item.dubbed
+          candidate.url,
+          candidate
         );
-      } catch (e) {
-        log(e);
-        notify('Film səhifəsinin formatı tanınmadı');
+      } catch (parseError) {
+        log(parseError);
+        message('Film HTML formatı tanınmadı');
         return;
       }
 
-      log(
-        'direct-streams',
-        found.streams.length,
-        'iframes',
-        found.iframeCount
-      );
-
-      if (!found.streams.length) {
-        if (found.reason === 'sub_only') {
-          notify('Bu səhifədə yalnız altyazı işarəsi var');
-        } else if (found.reason === 'iframe') {
-          notify('Dublaj var, amma video iframe-dədir; ayrıca resolver lazımdır');
+      if (!result.streams.length) {
+        if (result.iframeCount > 0) {
+          message(
+            'Video iframe içindədir. ' +
+            'Bu sayt üçün ayrıca resolver lazımdır.'
+          );
         } else {
-          notify('Türk dublyajlı birbaşa video linki təsdiqlənmədi');
+          message(
+            'Təsdiqlənmiş Türkçe Dublaj ' +
+            'video bağlantısı tapılmadı'
+          );
         }
         return;
       }
 
-      selectList(
-        found.streams,
-        'HDFC - Türkçe Dublaj',
+      if (result.streams.length === 1) {
+        playStream(movie, result.streams[0]);
+        return;
+      }
+
+      showItems(
+        'Türkçe Dublaj — Video',
+        result.streams,
         function (stream) {
-          Lampa.Player.play({
-            url: stream.url,
-            title: (
-              movie.title ||
-              movie.original_title ||
-              item.title
-            ),
-            movie: movie,
-            isonline: true
-          });
+          playStream(movie, stream);
         }
       );
     });
@@ -585,165 +566,195 @@
 
   function startSearch(movie) {
     if (!movie) {
-      notify('Film məlumatı boşdur');
+      message('Film məlumatları alınmadı');
       return;
     }
 
-    if (
-      movie.media_type === 'tv' ||
-      movie.number_of_seasons ||
-      movie.first_air_date
-    ) {
-      notify('Bu MVP yalnız filmlər üçündür; seriallar ayrıca modul tələb edir');
+    if (isSeries(movie)) {
+      message('Bu versiya yalnız filmlər üçündür');
       return;
     }
 
-    var names = aliases(movie);
-    var year = filmYear(movie);
+    var names = namesOf(movie);
+    var year = movieYear(movie);
 
     if (!names.length) {
-      notify('Film adı yoxdur');
+      message('Film adı tapılmadı');
       return;
     }
 
-    var token = stopPrevious();
-    var found = {};
-    var errors = 0;
+    var token = abortRequests();
+    var candidates = {};
     var index = 0;
+    var errors = 0;
 
-    notify(
-      'Axtarılır: ' +
-      names[0] +
+    message(
+      'Axtarılır: ' + names[0] +
       (year ? ' (' + year + ')' : '')
     );
 
     function next() {
-      if (token !== CURRENT) return;
+      if (token !== generation) return;
 
       if (index >= names.length) {
-        var output = Object.keys(found)
+        var results = Object.keys(candidates)
           .map(function (key) {
-            return found[key];
+            return candidates[key];
           })
           .sort(function (a, b) {
             return b.score - a.score;
           })
-          .slice(0, MAX_RESULTS);
+          .slice(0, LIMIT);
 
-        if (!output.length) {
-          notify(
+        if (!results.length) {
+          message(
             errors === names.length
-              ? 'Sayta giriş bloklandı (CORS/403)'
-              : 'Film və türk dublyaj uyğunluğu tapılmadı'
+              ? 'Sayta giriş mümkün olmadı (HTTP/CORS)'
+              : 'Uyğun film tapılmadı'
           );
           return;
         }
 
-        selectList(
-          output,
-          'HDFC - Türkçe Dublaj',
+        showItems(
+          'HDFC — Film seçimi',
+          results,
           function (item) {
-            openFilm(movie, item, token);
+            openCandidate(movie, item, token);
           }
         );
         return;
       }
 
-      var searchName = names[index++];
+      var name = names[index++];
+      var searchUrl = BASE + '/?s=' +
+        encodeURIComponent(name);
 
-      var searchLink =
-        BASE + '/?s=' +
-        encodeURIComponent(searchName);
-
-      requestHTML(
-        searchLink,
-        token,
-        function (err, page) {
-          if (err) {
-            errors++;
-            log('search failed', searchName, err);
-            next();
-            return;
-          }
-
-          try {
-            var list = parseSearchResults(
-              page,
-              searchLink,
-              names,
-              year
-            );
-
-            list.forEach(function (item) {
-              if (
-                !found[item.url] ||
-                item.score > found[item.url].score
-              ) {
-                found[item.url] = item;
-              }
-            });
-
-            log('results', searchName, list.length);
-          } catch (e) {
-            errors++;
-            log('parser failed', searchName, e);
-          }
-
+      request(searchUrl, token, function (error, html) {
+        if (error) {
+          errors++;
+          log('Search error', error);
           next();
+          return;
         }
-      );
+
+        try {
+          var matches = searchResults(
+            html,
+            searchUrl,
+            names,
+            year
+          );
+
+          matches.forEach(function (item) {
+            if (
+              !candidates[item.url] ||
+              item.score > candidates[item.url].score
+            ) {
+              candidates[item.url] = item;
+            }
+          });
+
+          log(name, matches.length, 'candidate(s)');
+        } catch (parseError) {
+          errors++;
+          log('Search parse error', parseError);
+        }
+
+        next();
+      });
     }
 
     next();
   }
 
+  function addButton(event) {
+    try {
+      if (!event || !event.object ||
+          !event.object.activity) return;
+
+      var root = event.object.activity.render();
+      if (!root || !root.find) return;
+
+      if (root.find('.view--hdfc-dub').length) {
+        return;
+      }
+
+      var movie = event.data && event.data.movie;
+
+      if (!movie) {
+        log('No movie in full event');
+        return;
+      }
+
+      if (isSeries(movie)) return;
+
+      var box = root.find(
+        '.full-start-new__buttons, .full-start__buttons'
+      ).eq(0);
+
+      if (!box.length) {
+        box = root.find('.view--torrent').parent();
+      }
+
+      if (!box.length) {
+        log('Full page button container not found');
+        return;
+      }
+
+      var button = $(
+        '<div class="full-start__button selector view--hdfc-dub">' +
+          '<svg width="24" height="24" ' +
+            'viewBox="0 0 24 24">' +
+            '<path fill="currentColor" ' +
+              'd="M8 5v14l11-7z"/>' +
+          '</svg>' +
+          '<span>Türkçe Dublaj</span>' +
+        '</div>'
+      );
+
+      button.on('hover:enter', function () {
+        log('Selected movie', movie);
+        startSearch(movie);
+      });
+
+      box.append(button);
+
+      log(
+        'Button added:',
+        movie.title || movie.original_title
+      );
+    } catch (error) {
+      console.error('[HDFC] addButton error:', error);
+    }
+  }
+
   function register() {
+    if (registered) return;
+
     if (
       !window.Lampa ||
-      !Lampa.Manifest ||
+      !Lampa.Listener ||
+      !Lampa.Listener.follow ||
       !Lampa.Reguest ||
       !Lampa.Select ||
       !Lampa.Player
     ) {
-      log('Lampa required APIs missing');
+      log('Waiting for Lampa APIs');
       return;
     }
 
-    Lampa.Manifest.plugins = {
-      type: 'video',
-      version: '0.3.0',
-      name: 'HDFC Türkçe Dublaj',
-      description:
-        'HDFC: film adına/ilinə görə axtarış, yalnız Türkçe Dublaj, direct media MVP',
-      component: 'hdfc_dub_v03',
+    registered = true;
 
-      onContextMenu: function () {
-        return {
-          name: 'HDFC Türkçe Dublaj',
-          description: 'Film üzrə axtarış (MVP)'
-        };
-      },
-
-      onContextLauch: function (movie) {
-        startSearch(movie);
+    Lampa.Listener.follow('full', function (event) {
+      if (event.type === 'complite') {
+        addButton(event);
       }
-    };
+    });
 
-    log('registered v0.3.0');
-  }
-
-  if (window.__HDFC_TEST_MODE__) {
-    window.__HDFC_TEST_UTILS__ = {
-      norm: norm,
-      hasDub: hasDub,
-      hasSub: hasSub,
-      sourceLanguage: sourceLanguage,
-      titleScore: titleScore,
-      aliases: aliases,
-      filmYear: filmYear,
-      parseSearchResults: parseSearchResults,
-      parseDirectStreams: parseDirectStreams
-    };
+    // Metadata is not used to replace
+    // Lampa.Manifest.plugins.
+    log('Plugin initialized successfully');
+    message('Türkçe Dublaj v0.4 hazırdır');
   }
 
   if (window.Lampa) {
@@ -753,10 +764,13 @@
       Lampa.Listener &&
       Lampa.Listener.follow
     ) {
-      Lampa.Listener.follow('app', function (e) {
-        if (e.type === 'ready')
+      Lampa.Listener.follow('app', function (event) {
+        if (event.type === 'ready') {
           register();
+        }
       });
+    } else {
+      log('Lampa initialization unavailable');
     }
   }
 })();
